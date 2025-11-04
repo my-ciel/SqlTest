@@ -1,0 +1,168 @@
+###################################################################################### 
+# TEST 1 : SQL 커서공유 모니터링 
+###################################################################################### 
+
+1. 다음을 실행한 후 커서 공유 상태를 확인합니다.
+ALTER SYSTEM FLUSH shared_pool;
+SELECT employee_id, first_name, EMAIL
+FROM employees
+WHERE employee_id = 108;
+SELECT employee_id, first_name, email 
+FROM employees
+WHERE employee_id = 108; # 여러 번 실행 
+
+SELECT sql_text, executions FROM v$sql
+WHERE sql_text LIKE 'SELECT employee_id%';
+
+SELECT sql_text, version_count, loads, invalidations, parse_calls, sorts
+FROM   v$sqlarea
+WHERE  parsing_user_id NOT IN (0, 5)
+AND    command_type = 3
+AND sql_text LIKE 'SELECT employee_id%';
+
+2. 공유풀을 Flush 후 다시 전체 실습을 반복한 후 SQL문의 커서정보를 확인합니다. 
+ALTER SYSTEM FLUSH shared_pool;
+SELECT employee_id, first_name, EMAIL
+FROM employees
+WHERE employee_id = 108;
+SELECT employee_id, first_name, email 
+FROM employees
+WHERE employee_id = 108; # 여러 번 실행 
+
+SELECT sql_text, executions FROM v$sql
+WHERE sql_text LIKE 'SELECT employee_id%';
+
+SELECT sql_text, version_count, loads, invalidations, parse_calls
+FROM   v$sqlarea
+WHERE  parsing_user_id NOT IN (0, 5)
+AND    command_type = 3
+AND sql_text LIKE 'SELECT employee_id%';
+
+결론: V$ SQL의 실행횟수는 FLUSH 전 후에도 계속 증가되므로 커서공유로 보이지만
+V$SQLAREA의 조회결과 FLUSH 후 로드수나 무효화가 발생한 결과로 Hard Parse가 발생했음을 알수 있습니다. 
+
+###################################################################################### 
+# TEST 2 : 구문 검사 vs 의미 검사 
+###################################################################################### 
+1. 다음 두 문장의 오류메시지의 차이점을 구분해 봅니다.
+SELECT * FORM employees;
+SELECT * FROM employee;
+
+두 명령문이 의미적으로 동일하더라도 환경적 차이로 인해 하드 파싱(hard parse)이 발생할 수 있습니다. 이는 옵티마이저 환경은 작업 영역 크기나 옵티마이저 설정(예: 옵티마이저 모드) 등 실행 계획 생성에 영향을 미칠 수 있는 세션 설정의 총체를 의미합니다. 
+단일 사용자가 실행하는 다음과 같은 일련의 SQL 문을 생각해 보겠습니다.
+
+ALTER SYSTEM FLUSH SHARED_POOL;   
+ALTER SESSION SET OPTIMIZER_MODE=ALL_ROWS; # optimizer environment 1
+SELECT * FROM employees;
+
+ALTER SESSION SET OPTIMIZER_MODE=FIRST_ROWS;  # optimizer environment 2
+SELECT * FROM employees;
+
+ALTER SESSION SET SQL_TRACE=true;             # optimizer environment 3
+SELECT * FROM employees;
+
+SELECT sql_text, executions FROM v$sql
+WHERE sql_text LIKE 'SELECT * FROM employees%';
+
+앞의 예에서 동일한 SELECT 문이 세 개의 서로 다른 옵티마이저 환경에서 실행됩니다. 결과적으로 데이터베이스는 이러한 문에 대해 세 개의 별도 공유 SQL 영역을 생성하고 각 문에 대해 하드 파싱(hard parsing)을 수행합니다.
+
+
+###################################################################################### 
+# TEST 3 바인드변수의 효과적인 사용
+###################################################################################### 
+
+1. employee_id의 값을 101 ~ 110 으로 변경하면서 실행합니다. 
+ALTER SYSTEM FLUSH shared_pool;
+
+SELECT employee_id, first_name, email FROM employees
+WHERE employee_id = 101;
+...... 
+SELECT employee_id, first_name, email FROM employees
+WHERE employee_id = 110;
+
+2. 커서 수를 확인합니다. 
+SELECT sql_text, executions, sql_id, version_count 
+FROM v$sqlarea 
+WHERE sql_text LIKE 'SELECT employee_id%';
+
+3. Shared Pool 초기화
+ALTER SYSTEM FLUSH SHARED_POOL;
+
+4. 다음 익명 PLSQL 실행
+SELECT * FROM employees 
+WHERE employee_id = :1;
+
+SELECT sql_text, executions, sql_id, version_count 
+FROM v$sqlarea 
+WHERE sql_text LIKE 'SELECT * FROM employees%';
+
+
+###################################################################################### 
+# TEST 4 cursor_sharing 파라미터 테스트
+###################################################################################### 
+
+1. 공유풀을 초기화하고 다음 명령문 10개를 실행합니다. 
+ALTER SYSTEM FLUSH shared_pool; 
+SELECT employee_id, first_name, email 
+FROM employees
+WHERE employee_id = 101;
+......
+SELECT employee_id, first_name, email 
+FROM employees
+WHERE employee_id = 110;
+
+2. 커서공유 여부를 확인합니다. 
+SELECT sql_text, executions FROM v$sql
+WHERE sql_text LIKE 'SELECT employee_id%';
+
+3. cursor_sharing 파라미터값을 확인 및 변경합니다. 
+show parameter cursor_sharing
+ALTER SYSTEM SET cursor_sharing=FORCE;
+
+4. 공유풀을 초기화한 후 다음 명령문10개를 실행합니다.
+ALTER SYSTEM FLUSH shared_pool;
+
+SELECT employee_id, first_name, email 
+FROM employees
+WHERE employee_id = 101;
+......
+SELECT employee_id, first_name, email 
+FROM employees
+WHERE employee_id = 110;
+
+5. 커서 공유를 확인합니다.
+
+SELECT sql_text, executions FROM v$sql
+WHERE sql_text LIKE 'SELECT employee_id%';
+
+6. cursor_sharing 파라미터를 초기화 합니다.
+
+ALTER SYSTEM SET cursor_sharing = 'EXACT';
+
+###################################################################################### 
+# TEST 5 공유풀의 주요 메모리 모니터
+###################################################################################### 
+
+1. Librarycache 성능을 모니터 합니다. 
+gethitratio는 SQL 커서나 PL/SQL 객체 등에 대한 요청 시, 라이브러리 캐시에서 객체 정보를 재사용(히트)한 비율을 나타냅니다. 이는 전체 Get 요청 중 디스크 I/O 없이 메모리에서 즉시 처리된 비율을 의미하며, 값이 1에 가까울수록 성능이 양호합니다. 주로 SQL 문장의 재파싱이 적을 때 높게 나타납니다.
+pinhitratio는 이미 메모리에 로드된 객체를 재사용할 때 내부적으로 참조(핀)한 횟수 중에서, 추가적인 로딩 없이 처리된 비율입니다. 즉, 개별 실행 시점에서 필요한 정보가 추가적인 I/O 없이 바로 사용 가능한 경우로, PL/SQL 또는 자주 호출되는 커서에서 이 비율이 낮다면 메모리 압박이나 캐시 오염이 의심됩니다.
+
+select gethitratio, pinhitratio
+from   v$librarycache
+where  namespace = 'SQL AREA';
+
+
+2. 버퍼캐시 적중율을 확인합니다.
+physical_reads
+실제 디스크 I/O가 발생한 횟수입니다. 이 값은 버퍼 캐시에 없는 블록을 디스크에서 읽어올 때 증가합니다.
+db_block_gets
+현재 트랜잭션이 변경한 블록을 읽을 때 사용되는 블록 요청 수입니다. 주로 DML(INSERT, UPDATE, DELETE) 수행 시 발생하며, Current block read라고도 합니다.
+consistent_gets
+일관된 읽기(consistent read)를 위해 Undo 정보를 사용하여 블록을 읽는 횟수입니다. 주로 SELECT 문이나, 과거 버전을 필요로 하는 쿼리에서 발생합니다.
+
+SELECT 
+  ROUND(
+    (1 - (physical_reads / (db_block_gets + consistent_gets))) * 100, 2
+   ) AS buffer_cache_hit_ratio
+FROM v$buffer_pool_statistics;
+
