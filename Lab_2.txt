@@ -339,20 +339,25 @@ show parameter optimizer_mode
 
 2. 다음 명령문의 실행계획을 확인합니다. 
 ALTER SYSTEM FLUSH shared_pool;
+
+EXPLAIN PLAN FOR
 SELECT *
 FROM   employees e JOIN departments d
 ON  (e.department_id = d.department_id)
 AND e.email='SSTILES' OR d.department_name='Treasury';
+SELECT * FROM table(dbms_xplan.display);
 
 3. Optimizer Mode를 세션레벨에서 FIRST_ROWS_1로 변경합니다.
 ALTER SESSION SET optimizer_mode=first_rows_1;
 
 4. 이전에 실행한 명령문의 실행계획을 다시 확인합니다. 
 ALTER SYSTEM FLUSH shared_pool;
+EXPLAIN PLAN FOR
 SELECT *
 FROM   employees e JOIN departments d
 ON  (e.department_id = d.department_id)
 AND e.email='SSTILES' OR d.department_name='Treasury';
+SELECT * FROM table(dbms_xplan.display);
 
 5. 최적화 모드를 다시 ALL_ROWS로 수정하고 실습에 사용한 인덱스를 삭제하여 실습을 초기화 합니다. 
 ALTER SESSION SET optimizer_mode=all_rows;
@@ -460,4 +465,5 @@ SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
 
 5. 인덱스를 삭제하여 실습을 정리합니다.
 DROP INDEX bigemp_email_ix ;
+
 DROP INDEX bigemp_deptid_ix ;
