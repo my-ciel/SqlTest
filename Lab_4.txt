@@ -1,0 +1,286 @@
+##############################################################
+# TEST 1 :실습 준비
+##############################################################
+SELECT table_name, index_name
+FROM user_indexes
+WHERE table_name IN ('BIGEMP','DEPARTMENTS');
+
+DROP INDEX bigemp_deptid_idx;
+DROP INDEX bigemp_id_ix;
+ALTER TABLE departments DROP PRIMARY KEY CASCADE;
+
+exec dbms_stats.delete_schema_stats('C##HR');
+##############################################################
+# TEST 2 :조인작업의 이해 
+##############################################################
+1. 통계정보와 조인키열에 인덱스가 모두 없는 경우
+
+EXPLAIN PLAN FOR
+SELECT e.first_name, e.salary, d.department_name
+FROM departments d JOIN bigemp e 
+ON d.department_id = e.department_id;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+----------------------------------------------------------------------------------
+| Id  | Operation          | Name        | Rows  | Bytes | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |             |   583K|    58M|    10  (50)| 00:00:01 |
+|*  1 |  HASH JOIN         |             |   583K|    58M|    10  (50)| 00:00:01 |
+|   2 |   TABLE ACCESS FULL| DEPARTMENTS |    27 |   810 |     3   (0)| 00:00:01 |
+|   3 |   TABLE ACCESS FULL| BIGEMP      |   583K|    21M|     2   (0)| 00:00:01 |
+----------------------------------------------------------------------------------
+
+2. 조인문에 추가로 필터조건을 추가하면 드라이빙 테이블이 변경될 수 있습니다.
+EXPLAIN PLAN FOR
+SELECT e.first_name, e.salary, d.department_name
+FROM departments d JOIN bigemp e 
+ON d.department_id = e.department_id
+WHERE employee_id = 1001;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+----------------------------------------------------------------------------------
+| Id  | Operation          | Name        | Rows  | Bytes | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |             |    96 |  7776 |    94   (2)| 00:00:01 |
+|   1 |  NESTED LOOPS      |             |    96 |  7776 |    94   (2)| 00:00:01 |
+|*  2 |   TABLE ACCESS FULL| BIGEMP      |    50 |  2550 |    51   (0)| 00:00:01 |
+|*  3 |   TABLE ACCESS FULL| DEPARTMENTS |     2 |    60 |     1   (0)| 00:00:01 |
+----------------------------------------------------------------------------------
+
+3. 테이블 순서대로 조인하도록 힌트를 추가해 봅니다.
+EXPLAIN PLAN FOR
+SELECT /*+ ordered */ e.first_name, e.salary, d.department_name
+FROM departments d JOIN bigemp e 
+ON d.department_id = e.department_id
+WHERE employee_id = 1001;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+----------------------------------------------------------------------------------
+| Id  | Operation          | Name        | Rows  | Bytes | Cost (%CPU)| Time     |
+----------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT   |             |   122 |  9882 |   678   (1)| 00:00:01 |
+|*  1 |  HASH JOIN         |             |   122 |  9882 |   678   (1)| 00:00:01 |
+|   2 |   TABLE ACCESS FULL| DEPARTMENTS |    27 |   810 |     3   (0)| 00:00:01 |
+|*  3 |   TABLE ACCESS FULL| BIGEMP      |    50 |  2550 |   675   (1)| 00:00:01 |
+----------------------------------------------------------------------------------
+
+4. SORT MERGE JOIN 힌트 적용하고 코스트를 비교해 봅니다.
+EXPLAIN PLAN FOR
+SELECT /*+ USE_MERGE(e d) */  e.first_name, e.salary, d.department_name
+FROM departments d JOIN bigemp e 
+ON d.department_id = e.department_id;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+-------------------------------------------------------------------------------------------
+| Id  | Operation           | Name        | Rows  | Bytes |TempSpc| Cost (%CPU)| Time     |
+-------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |             |   583K|    58M|       |  7024   (1)| 00:00:01 |
+|   1 |  MERGE JOIN         |             |   583K|    58M|       |  7024   (1)| 00:00:01 |
+|   2 |   SORT JOIN         |             |   583K|    21M|    53M|  7020   (1)| 00:00:01 |
+|   3 |    TABLE ACCESS FULL| BIGEMP      |   583K|    21M|       |  1247   (2)| 00:00:01 |
+|*  4 |   SORT JOIN         |             |    27 |   810 |       |     4  (25)| 00:00:01 |
+|   5 |    TABLE ACCESS FULL| DEPARTMENTS |    27 |   810 |       |     3   (0)| 00:00:01 |
+-------------------------------------------------------------------------------------------
+
+EXPLAIN PLAN FOR
+SELECT /*+ USE_MERGE(e d) */  e.first_name, e.salary, d.department_name
+FROM departments d JOIN bigemp e 
+ON d.department_id = e.department_id
+WHERE employee_id = 1001;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+-----------------------------------------------------------------------------------
+| Id  | Operation           | Name        | Rows  | Bytes | Cost (%CPU)| Time     |
+-----------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |             |    96 | 12672 |  1246   (2)| 00:00:01 |
+|   1 |  MERGE JOIN         |             |    96 | 12672 |  1246   (2)| 00:00:01 |
+|   2 |   SORT JOIN         |             |    50 |  2550 |  1242   (2)| 00:00:01 |
+|*  3 |    TABLE ACCESS FULL| BIGEMP      |    50 |  2550 |  1241   (1)| 00:00:01 |
+|*  4 |   SORT JOIN         |             |    27 |   810 |     4  (25)| 00:00:01 |
+|   5 |    TABLE ACCESS FULL| DEPARTMENTS |    27 |   810 |     3   (0)| 00:00:01 |
+-----------------------------------------------------------------------------------
+
+
+5. 테이블 통계 생성 후 이전 명령문들을 다시 분석해봅니다.
+통계 정보 생성 후 옵티마이저가 이제 테이블의 실제 크기와 데이터 분포를 정확히 알게 되었기 때문에 
+실행계획의 Cost가 이전보다 더 높게 나오는 경우도 있습니다.
+
+exec dbms_stats.gather_schema_stats('c##HR');
+
+--예시
+EXPLAIN PLAN FOR
+SELECT /*+ USE_MERGE(e d) */  e.first_name, e.salary, d.department_name
+FROM departments d JOIN bigemp e 
+ON d.department_id = e.department_id;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+-------------------------------------------------------------------------------------------
+| Id  | Operation           | Name        | Rows  | Bytes |TempSpc| Cost (%CPU)| Time     |
+-------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT    |             |     3 |   141 |       |  3515   (2)| 00:00:01 |
+|   1 |  MERGE JOIN         |             |     3 |   141 |       |  3515   (2)| 00:00:01 |
+|   2 |   SORT JOIN         |             |    27 |   432 |       |     4  (25)| 00:00:01 |
+|   3 |    TABLE ACCESS FULL| DEPARTMENTS |    27 |   432 |       |     3   (0)| 00:00:01 |
+|*  4 |   SORT JOIN         |             |   438K|  6420K|    23M|  3511   (2)| 00:00:01 |
+|   5 |    TABLE ACCESS FULL| BIGEMP      |   438K|  6420K|       |  1243   (2)| 00:00:01 |
+-------------------------------------------------------------------------------------------
+
+6. 참조 관계의 테이블에 제약조건 및 인덱를 추가합니다.
+또한 메모리를 비우고 객체 통계데이터를 갱신합니다.
+ALTER TABLE bigemp ADD PRIMARY KEY(employee_id);
+ALTER TABLE departments ADD PRIMARY KEY(department_id);
+ALTER TABLE bigemp ADD CONSTRAINT bigemp_deptid_fk 
+FOREIGN KEY(department_id)
+REFERENCES departments;
+CREATE INDEX bigemp_deptid_ix ON bigemp(department_id);
+
+ALTER SYSTEM FLUSH shared_pool;
+ALTER SYSTEM FLUSH buffer_cache;
+exec dbms_stats.gather_schema_stats('c##HR');
+
+7. 다시 여러 조인문을 실행하고 실행계획을 검토합니다. 
+--예시
+EXPLAIN PLAN FOR
+SELECT e.first_name, e.salary, d.department_name
+FROM departments d JOIN bigemp e 
+ON d.department_id = e.department_id
+WHERE d.department_id = 10;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+ 
+---------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name             | Rows  | Bytes | Cost (%CPU)| Time     |
+---------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                  |     1 |    31 |     4   (0)| 00:00:01 |
+|   1 |  NESTED LOOPS                        |                  |     1 |    31 |     4   (0)| 00:00:01 |
+|   2 |   TABLE ACCESS BY INDEX ROWID        | DEPARTMENTS      |     1 |    16 |     1   (0)| 00:00:01 |
+|*  3 |    INDEX UNIQUE SCAN                 | SYS_C0027272     |     1 |       |     0   (0)| 00:00:01 |
+|   4 |   TABLE ACCESS BY INDEX ROWID BATCHED| BIGEMP           |     1 |    15 |     3   (0)| 00:00:01 |
+|*  5 |    INDEX RANGE SCAN                  | BIGEMP_DEPTID_IX |     1 |       |     2   (0)| 00:00:01 |
+---------------------------------------------------------------------------------------------------------
+
+8. 중첩루프조인 힌트를 사용해 봅니다. 
+EXPLAIN PLAN FOR
+SELECT /*+ USE_NL(e) */ 
+       e.first_name, e.salary, d.department_name
+FROM departments d
+JOIN bigemp e ON d.department_id = e.department_id
+WHERE d.department_id = 10;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY); 
+ 
+---------------------------------------------------------------------------------------------------------
+| Id  | Operation                            | Name             | Rows  | Bytes | Cost (%CPU)| Time     |
+---------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                     |                  |     1 |    31 |     4   (0)| 00:00:01 |
+|   1 |  NESTED LOOPS                        |                  |     1 |    31 |     4   (0)| 00:00:01 |
+|   2 |   TABLE ACCESS BY INDEX ROWID        | DEPARTMENTS      |     1 |    16 |     1   (0)| 00:00:01 |
+|*  3 |    INDEX UNIQUE SCAN                 | SYS_C0027272     |     1 |       |     0   (0)| 00:00:01 |
+|   4 |   TABLE ACCESS BY INDEX ROWID BATCHED| BIGEMP           |     1 |    15 |     3   (0)| 00:00:01 |
+|*  5 |    INDEX RANGE SCAN                  | BIGEMP_DEPTID_IX |     1 |       |     2   (0)| 00:00:01 |
+---------------------------------------------------------------------------------------------------------
+
+##############################################################
+# TEST 3 :조인 튜닝 사례
+##############################################################
+1. 메인 테이블(예: DEPARTMENTS)은 행이 적은데, 집계(예: COUNT)가 필요한 테이블(예: BIGEMP)의 행이 매우 많을 경우
+-- AS IS : 거대한 조인 중간 결과 집합을 생성한 후, 다시 GROUP BY로 집계합니다.
+explain plan for
+SELECT d.department_name, COUNT(e.employee_id) AS emp_count
+FROM   departments d JOIN bigemp e 
+ON d.department_id = e.department_id
+GROUP BY d.department_id, d.department_name;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY); 
+--------------------------------------------------------------------------------------------
+| Id  | Operation               | Name             | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT        |                  |     1 |    29 |   202   (1)| 00:00:01 |
+|   1 |  NESTED LOOPS           |                  |     1 |    29 |   202   (1)| 00:00:01 |
+|   2 |   TABLE ACCESS FULL     | DEPARTMENTS      |     3 |    48 |     2   (0)| 00:00:01 |
+|   3 |   VIEW PUSHED PREDICATE | VW_GBF_7         |     1 |    13 |    67   (2)| 00:00:01 |
+|*  4 |    FILTER               |                  |       |       |            |          |
+|   5 |     SORT AGGREGATE      |                  |     1 |     4 |            |          |
+|*  6 |      INDEX RANGE SCAN   | BIGEMP_DEPTID_IX | 39843 |   155K|    81   (2)| 00:00:01 |
+--------------------------------------------------------------------------------------------
+
+
+--TO BE : SELECT 절에 스칼라 서브쿼리(Scalar Subquery)를 사용합니다.
+explain plan for
+SELECT d.department_name,
+       (SELECT COUNT(*)
+        FROM   bigemp e
+        WHERE  e.department_id = d.department_id) AS emp_count 
+FROM   departments d;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY); 
+--------------------------------------------------------------------------------------
+| Id  | Operation         | Name             | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT  |                  |     1 |    16 |    83   (2)| 00:00:01 |
+|   1 |  SORT AGGREGATE   |                  |     1 |     4 |            |          |
+|*  2 |   INDEX RANGE SCAN| BIGEMP_DEPTID_IX | 39843 |   155K|    81   (2)| 00:00:01 |
+|   3 |  TABLE ACCESS FULL| DEPARTMENTS      |     1 |    16 |     2   (0)| 00:00:01 |
+--------------------------------------------------------------------------------------
+
+--개선점 : DEPARTMENTS 테이블을 먼저 읽고, 각 부서 행마다 bigemp 테이블의 department_id 인덱스를 타는 COUNT 쿼리를 실행합니다. '거대한 조인 1번'보다 '빠른 인덱스 조회 여러번'이 훨씬 효율적입니다.
+
+2. WHERE 절에 OR로 여러 조건이 섞여 있어 옵티마이저가 각 조건의 인덱스를 효율적으로 사용하지 못하는 경우
+--AS-IS : 'Sales' 직원이거나 'IT' 부서에 속한 직원 정보를 조회합니다.
+EXPLAIN PLAN FOR
+SELECT e.last_name, d.department_name
+FROM  bigemp e JOIN   departments d 
+ON e.department_id = d.department_id
+WHERE  e.job_id= 'SA_REP' OR d.department_name = 'IT';
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY); 
+
+
+##############################################################
+# TEST 4 :서브쿼리 최적화 사례
+##############################################################
+1. 스칼라 서브쿼리를 조인으로 최적화
+--스칼라서브쿼리
+EXPLAIN PLAN FOR
+SELECT e.employee_id,
+       (SELECT department_name 
+        FROM dept d 
+        WHERE d.department_id = e.department_id) AS dept_name
+FROM bigemp e;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+
+--조인으로 최적화
+EXPLAIN PLAN FOR
+SELECT e.employee_id, d.department_name
+FROM bigemp e
+JOIN dept d ON e.department_id = d.department_id;
+
+--개선점 : 스칼라 서브쿼리는 반복 액세스 문제로 느릴 수 있으나, 이를 조인으로 바꾸면 하나의 테이블 연결로 대량 데이터를 효율적으로 조회할 수 있습니다. 
+
+2. 집계 서브쿼리를 인라인 뷰 조인으로 최적화
+--집계 서브쿼리
+EXPLAIN PLAN FOR
+SELECT d.department_id,
+       (SELECT COUNT(*)
+        FROM bigemp e
+        WHERE e.department_id = d.department_id) AS emp_count
+FROM departments d;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+
+--인라인뷰로 최적화
+EXPLAIN PLAN FOR
+SELECT d.department_id, ec.emp_count
+FROM departments d
+JOIN (
+  SELECT department_id, COUNT(*) AS emp_count
+  FROM bigemp
+  GROUP BY department_id
+) ec ON d.department_id = ec.department_id;
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+  
+개선점 : 인라인 뷰와 GROUP BY로 사전 집계 후 조인하는 방식이 상관 서브쿼리 방식보다 훨씬 성능이 뛰어납니다.
+특히 employees 테이블처럼 행 수가 많을수록 차이는 더 커지며, 인라인 뷰 최적화는 SQL 튜닝의 대표적인 베스트 프랙티스 중 하나입니다.
+
