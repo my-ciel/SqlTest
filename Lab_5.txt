@@ -1,0 +1,169 @@
+##############################################################
+# TEST 1 : NULL과 인덱스
+##############################################################
+1. EMPLOYEES 테이블의 인덱스화된 열을 조회합니다.
+EXEC dbms_stats.gather_schema_stats('c##hr');
+
+SELECT i.index_name, c.column_name, c.column_position
+FROM user_indexes i JOIN user_ind_columns c
+USING (table_name)
+WHERE table_name = 'EMPLOYEES';
+
+2. department_id 열에 인덱스를 생성합니다.
+SELECT distinct department_id FROM employees;
+CREATE INDEX emp_deptid_ix ON employees(department_id);
+
+3. 다음 두 쿼리의 실행계획을 확인합니다.
+SELECT * FROM employees
+WHERE department_id IS NULL;
+
+CREATE INDEX emp_deptid_ix ON employees(department_id);
+EXPLAIN PLAN FOR
+SELECT * FROM employees
+WHERE department_id = 30;
+SELECT * FROM table(dbms_xplan.display);
+
+EXPLAIN PLAN FOR
+SELECT * FROM employees
+WHERE department_id != 30;
+SELECT * FROM table(dbms_xplan.display);
+
+--두 번째 쿼리는 널값도 고려해야 하므로 풀테이블 스켄이 발생합니다. 
+
+DROP INDEX emp_deptid_ix;
+
+
+##############################################################
+# TEST 2 : INDEX UNIQUE SCAN과 INDEX RANGE SCAN
+##############################################################
+EXPLAIN PLAN FOR
+SELECT employee_id, first_name, salary FROM employees
+WHERE employee_id = 103;
+SELECT * FROM table(dbms_xplan.display);
+
+EXPLAIN PLAN FOR
+SELECT employee_id, first_name, salary FROM employees
+WHERE employee_id BETWEEN 100 AND 120;
+SELECT * FROM table(dbms_xplan.display);
+
+##############################################################
+# TEST 3 : INDEX FULL SCAN vs INDEX FFS(INDEX FAST FULL SCAN)
+##############################################################
+1. 다음 명령은 INDEX FULL SCAN이 발생합니다. 
+EXPLAIN PLAN FOR
+SELECT * FROM employees
+ORDER BY employee_id;
+SELECT * FROM table(dbms_xplan.display);
+
+2. 다음 명령은 INDEX FAST FULL SCAN이 발생합니다. 
+CREATE INDEX cust_name_ix on customers(cust_first_name, cust_last_name);
+EXPLAIN PLAN FOR
+SELECT cust_first_name, cust_last_name from customers;
+SELECT * FROM table(dbms_xplan.display);
+
+##############################################################
+# TEST 4 :  파티션테이블로 SQL 쿼리 성능 향상 
+##############################################################
+
+1. BIGEMP 테이블의 HIRE_DATE 열에 인덱스를 추가하고 쿼리수행의 결과를 확인합니다.
+CREATE INDEX bigemp_hiredate_ix ON bigemp(hire_date);
+EXPLAIN PLAN FOR
+SELECT COUNT(*) FROM BIGEMP
+WHERE HIRE_DATE BETWEEN TO_DATE('2011-01-01', 'YYYY-MM-DD') AND TO_DATE('2012-12-31', 'YYYY-MM-DD');
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+--------------------------------------------------------------------------------------------
+| Id  | Operation             | Name               | Rows  | Bytes | Cost (%CPU)| Time     |
+--------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT      |                    |     1 |     8 |   323   (3)| 00:00:01 |
+|   1 |  SORT AGGREGATE       |                    |     1 |     8 |            |          |
+|*  2 |   INDEX FAST FULL SCAN| BIGEMP_HIREDATE_IX |   122K|   960K|   323   (3)| 00:00:01 |
+--------------------------------------------------------------------------------------------
+
+2. 연도별 파티셔닝을 수행할 BIGEMP_PART 테이블을 생성합니다.
+CREATE TABLE BIGEMP_PART (
+    EMPLOYEE_ID    NUMBER(6) NOT NULL,
+    FIRST_NAME     VARCHAR2(20),
+    LAST_NAME      VARCHAR2(25) NOT NULL,
+    EMAIL          VARCHAR2(25) NOT NULL,
+    PHONE_NUMBER   VARCHAR2(20),
+    HIRE_DATE      DATE NOT NULL,
+    JOB_ID         VARCHAR2(10) NOT NULL,
+    SALARY         NUMBER(8,2),
+    COMMISSION_PCT NUMBER(2,2),
+    MANAGER_ID     NUMBER(6),
+    DEPARTMENT_ID  NUMBER(4)
+)
+PARTITION BY RANGE (HIRE_DATE) (
+    PARTITION p_2011 VALUES LESS THAN (TO_DATE('2012-01-01', 'YYYY-MM-DD')),
+    PARTITION p_2012 VALUES LESS THAN (TO_DATE('2013-01-01', 'YYYY-MM-DD')),
+    PARTITION p_2013 VALUES LESS THAN (TO_DATE('2014-01-01', 'YYYY-MM-DD')),
+    PARTITION p_2014 VALUES LESS THAN (TO_DATE('2015-01-01', 'YYYY-MM-DD')),
+    PARTITION p_2015 VALUES LESS THAN (TO_DATE('2016-01-01', 'YYYY-MM-DD')),
+    PARTITION p_2016 VALUES LESS THAN (TO_DATE('2017-01-01', 'YYYY-MM-DD')),
+    PARTITION p_2017 VALUES LESS THAN (TO_DATE('2018-01-01', 'YYYY-MM-DD')),
+    PARTITION p_max  VALUES LESS THAN (MAXVALUE) -- 2018년 및 그 이후 모든 데이터
+);
+
+3. BIGEMP_PART 테이블에 원본 BIGEMP의 40만 건 데이터를 이전후 인덱스등을생성합니다.
+대량 삽입 시 성능 향상을 위해 /*+ APPEND */ 힌트를 사용하는 것이 좋습니다.
+
+INSERT /*+ APPEND */ INTO BIGEMP_PART
+SELECT * FROM BIGEMP;
+
+COMMIT;
+EXEC DBMS_STATS.GATHER_TABLE_STATS('C##HR', 'BIGEMP_PART');
+
+4. 파티션테이블로부터 이전쿼리를 수행해봅니다.
+인덱스가 없어도 파티션 프루닝에 의해 테이블 파티션 구조 자체가 HIRE_DATE에 대한 거대한 인덱스와 같이
+성능을 개선시킵니다.
+ALTER SYSTEM FLUSH SHARED_POOL;
+ALTER SYSTEM FLUSH BUFFER_CACHE;
+
+EXPLAIN PLAN FOR
+SELECT COUNT(*) FROM bigemp_part
+WHERE HIRE_DATE BETWEEN TO_DATE('2011-01-01', 'YYYY-MM-DD') AND TO_DATE('2012-12-31', 'YYYY-MM-DD');
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+
+5. LAST_NAME 컬럼에 대해 글로벌 인덱스를 생성하고 테스트합니다.
+이 인덱스는 테이블 파티션(p_2011, p_2012...)과 상관없이 40만 건 전체의 LAST_NAME을 가진 하나의 큰 인덱스입니다.
+CREATE INDEX idx_lastname_global ON BIGEMP_PART(LAST_NAME) GLOBAL;
+
+EXPLAIN PLAN FOR
+SELECT * FROM BIGEMP_PART
+WHERE LAST_NAME = 'King'
+AND HIRE_DATE BETWEEN TO_DATE('2013-01-01', 'YYYY-MM-DD') AND TO_DATE('2013-12-31', 'YYYY-MM-DD');
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+----------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                  | Name                | Rows  | Bytes | Cost (%CPU)| Time     | Pstart| Pstop |
+----------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                           |                     |  4442 |   576K|     4   (0)| 00:00:01 |       |       |
+|*  1 |  TABLE ACCESS BY GLOBAL INDEX ROWID BATCHED| BIGEMP_PART         |  4442 |   576K|     4   (0)| 00:00:01 |     3 |     3 |
+|*  2 |   INDEX RANGE SCAN                         | IDX_LASTNAME_GLOBAL |       |       |     3   (0)| 00:00:01 |       |       |
+----------------------------------------------------------------------------------------------------------------------------------
+DROP INDEX idx_lastname_global;
+
+6. LAST_NAME 컬럼에 대해 로컬 인덱스를 생성하고 테스트합니다.
+이 인덱스는 테이블 파티션을 1:1로 따라가는 여러 개의 작은 인덱스 조각(p_2012용, p_2013용...)으로 생성됩니다.
+CREATE INDEX idx_lastname_local ON BIGEMP_PART(LAST_NAME) LOCAL;
+
+EXEC DBMS_STATS.GATHER_TABLE_STATS('C##HR', 'BIGEMP_PART');
+ALTER SYSTEM FLUSH SHARED_POOL;
+ALTER SYSTEM FLUSH BUFFER_CACHE;
+
+EXPLAIN PLAN FOR
+SELECT * FROM BIGEMP_PART
+WHERE LAST_NAME = 'King'
+AND HIRE_DATE BETWEEN TO_DATE('2013-01-01', 'YYYY-MM-DD') AND TO_DATE('2013-12-31', 'YYYY-MM-DD');
+
+SELECT * FROM TABLE(DBMS_XPLAN.DISPLAY);
+---------------------------------------------------------------------------------------------------------------------------------
+| Id  | Operation                                  | Name               | Rows  | Bytes | Cost (%CPU)| Time     | Pstart| Pstop |
+---------------------------------------------------------------------------------------------------------------------------------
+|   0 | SELECT STATEMENT                           |                    |  3958 |   514K|     2   (0)| 00:00:01 |       |       |
+|   1 |  PARTITION RANGE SINGLE                    |                    |  3958 |   514K|     2   (0)| 00:00:01 |     3 |     3 |
+|*  2 |   TABLE ACCESS BY LOCAL INDEX ROWID BATCHED| BIGEMP_PART        |  3958 |   514K|     2   (0)| 00:00:01 |     3 |     3 |
+|*  3 |    INDEX RANGE SCAN                        | IDX_LASTNAME_LOCAL |       |       |     1   (0)| 00:00:01 |     3 |     3 |
+---------------------------------------------------------------------------------------------------------------------------------
